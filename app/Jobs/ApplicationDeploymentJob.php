@@ -370,6 +370,9 @@ class ApplicationDeploymentJob implements ShouldBeEncrypted, ShouldQueue
         if ($this->server->isProxyShouldRun()) {
             GetContainersStatus::dispatch($this->server);
         }
+
+        $this->update_github_deployment_status(ApplicationDeploymentStatus::tryFrom($this->application_deployment_queue->status) ?? ApplicationDeploymentStatus::FAILED);
+
         $this->next(ApplicationDeploymentStatus::FINISHED->value);
         if ($this->pull_request_id !== 0) {
             if ($this->application->is_github_based()) {
@@ -2349,6 +2352,9 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
         if (empty($this->application->pre_deployment_command)) {
             return;
         }
+
+        $this->update_github_deployment_status(ApplicationDeploymentStatus::IN_PROGRESS);
+
         $containers = getCurrentApplicationContainerStatus($this->server, $this->application->id, $this->pull_request_id);
         if ($containers->count() == 0) {
             return;
@@ -2455,6 +2461,45 @@ COPY ./nginx.conf /etc/nginx/conf.d/default.conf");
                     );
                 }
             }
+        }
+    }
+
+    private function update_github_deployment_status(ApplicationDeploymentStatus $status)
+    {
+        if (!$this->application->is_github_based()) {
+            return;
+        }
+
+        $source = $this->application->github_app; // GitHub source
+        $repo = $this->application->repository;
+        $owner = $this->application->owner;
+        $deploymentId = $this->deployment_uuid;
+
+        // ✅ Convert enum to GitHub API status
+        $state = match ($status) {
+            ApplicationDeploymentStatus::FINISHED => 'success',
+            ApplicationDeploymentStatus::IN_PROGRESS => 'in_progress',
+            default => 'failure'
+        };
+
+        try {
+            ['data' => $data] = githubApi(
+                source: $source,
+                endpoint: "/repos/{$owner}/{$repo}/deployments/{$deploymentId}/statuses",
+                method: 'post',
+                data: [
+                    'state' => $state,
+                    'description' => "Deployment is {$state} in Coolify",
+                    'auto_inactive' => true,
+                ],
+                throwError: false
+            );
+
+            if (!$data) {
+                $this->application_deployment_queue->addLogEntry("GitHub Deployment Status Update Failed: No response data.");
+            }
+        } catch (\Exception $e) {
+            $this->application_deployment_queue->addLogEntry("GitHub Deployment Status Update Failed: " . $e->getMessage());
         }
     }
 }
